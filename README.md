@@ -192,7 +192,7 @@
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/<你的用户名>/comfyui-h3-qwen.git
+git clone https://github.com/zhifu3158/comfyui-h3-qwen.git
 # 重启 ComfyUI
 ```
 
