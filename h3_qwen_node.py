@@ -1,34 +1,29 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-H3_Qwen通信节点 (comfyui-h3-qwen)
+H3_Qwen通信节点 (comfyui-h3-qwen) —— 最终版
 ================================================================================
-功能：与独立运行的 Qwen3.8-27B VLM 服务，通过 /dev/shm 文件信号进行通信。
+功能：与独立运行的 Qwen3.8-27B VLM 服务，通过 /dev/shm 文件信号通信。
 
-架构示意：
-    ┌──── ComfyUI 进程（本节点）────┐         ┌──── Qwen 独立服务 ────┐
-    │ 1. 写帧数据  h3_frames.npy    │──写入──→│ 每1秒轮询 request     │
-    │ 2. 写请求    h3_request.json  │         │ 读取后执行推理        │
-    │ 3. 每1秒轮询 h3_result.json   │←─写入──│ 写 h3_result.json     │
-    │ 4. 读结果 → 清理 shm 文件     │         │ 删 h3_request.json    │
-    └───────────────────────────────┘         └───────────────────────┘
+【启用=False 透传模式】
+  节点啥都不干：结果文本 = 原始提问词(#138 原文，不含附加指令/系统提示词)，
+  是否正常=True（放行），错误信息=""。二选一开关在此模式不生效。
+
+【启用=True 工作模式】
+  ① 服务预检：开头先探心跳，超过【服务检测超时】无有效心跳→通信失败。
+  ② 通信失败时看【失败回退原文】：开→结果文本=原始提问词；关→结果文本=错误信息。
+  ③ 检测不通过(含 "pass": false)：结果文本=Qwen检测文本，不走回退。
+  ④ 正常：结果文本=Qwen回复，是否正常=True。
+
+输出：结果文本(STRING) + 是否正常(BOOLEAN) + 错误信息(STRING)
 
 设计铁律：
-  1. 节点【不判断】是第几次介入（提示词完善 / 画面检测），只负责"传数据+收结果"，
-     业务含义由用户通过 系统提示词 / 提问词 / 附加指令 自行指定。
-  2. 统一【阻塞式】：写请求后每 1 秒轮询结果，直到超时。
-  3. 【是否正常】是输出（不是输入），由用户自行决定后续工作流走向：
-       True  = Qwen 正常工作（完善成功 / 检测通过）
-       False = 通信异常（未启动/超时/空结果）或 检测不通过（含 "pass": false）
-  4. 防泄漏：/dev/shm 固定文件名覆盖写，永远只有 3 个文件，不会累积。
+  1. 节点不判断介入次数，只负责"传数据+收结果"。
+  2. 统一阻塞式：写请求后每 1 秒轮询结果，直到超时。
+  3. 防泄漏：/dev/shm 固定文件名覆盖写，永远只有 3 个文件。
 
-色彩协议（重要）：
-  h3_frames.npy 统一存储 【RGB】 uint8。
-  ⚠️ Qwen 服务端用 cv2.imencode 前必须先转 BGR：
-     bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
-  否则红蓝通道颠倒，"冷蓝+暖橙"色调检测会出错！
-
-环境依赖：numpy(系统2.1.3) / cv2(opencv-headless) / /dev/shm / /mnt/workspace/pickup
+色彩协议：h3_frames.npy 统一存【RGB】uint8；服务端 imencode 前需转 BGR。
+心跳协议：Qwen 服务主循环每秒写 /tmp/h3_vlm_heartbeat。
 ================================================================================
 """
 
@@ -37,171 +32,193 @@ import time
 import json
 import numpy as np
 
-# ==================== /dev/shm 通信文件协议（固定文件名，覆盖写，防泄漏） ====================
-SHM_FRAMES  = "/dev/shm/h3_frames.npy"     # 帧数据: [N, H, W, 3] uint8 (RGB)
-SHM_REQUEST = "/dev/shm/h3_request.json"   # 请求参数: 提问词/系统提示词/skills/剧本/温度等
-SHM_RESULT  = "/dev/shm/h3_result.json"    # 推理结果: Qwen服务写入, 本节点读取后清理
+# ==================== /dev/shm 通信文件协议 ====================
+SHM_FRAMES  = "/dev/shm/h3_frames.npy"
+SHM_REQUEST = "/dev/shm/h3_request.json"
+SHM_RESULT  = "/dev/shm/h3_result.json"
 
-# ==================== 结果持久化目录（取件码机制，与 app.py 一致） ====================
-PICKUP_DIR  = "/mnt/workspace/pickup"      # 结果存为 {请求标识}_detection.json，可经 /video/ 路由下载
+# ==================== 服务心跳文件（预检用） ====================
+HEARTBEAT       = "/tmp/h3_vlm_heartbeat"
+HEARTBEAT_FRESH = 3.0   # 心跳新鲜度容忍(秒)
 
-# ==================== 轮询间隔（用户指定 1 秒，避免高频轮询造成系统卡顿） ====================
+# ==================== 结果持久化目录 ====================
+PICKUP_DIR = "/mnt/workspace/pickup"
+
+# ==================== 轮询间隔 ====================
 POLL_INTERVAL = 1.0
 
-# ==================== 异常信息前缀（用于异常标志识别） ====================
+# ==================== 异常信息前缀 ====================
 ERR_PREFIX = "[H3_Qwen通信]"
 
 
 class H3_QwenComm:
     """
-    H3_Qwen通信节点：与独立 Qwen3.8 服务通信的"哑管道"。
-    输入：图片/视频数据 + 提示词 + 技能/剧本文件路径 + 推理参数
-    输出：结果文本(STRING) + 是否正常(BOOLEAN)
+    H3_Qwen通信节点（哑管道）：
+    输出：结果文本(STRING) + 是否正常(BOOLEAN) + 错误信息(STRING)
     """
 
-    # 节点级描述（显示在 ComfyUI "信息" 面板顶部）
     DESCRIPTION = (
-        "与独立运行的 Qwen3.8-27B VLM 服务通信（/dev/shm 文件信号，每1秒轮询）。\n"
-        "不判断介入次数：第一次(提示词完善)或第二次(画面检测)由你的系统提示词/提问词决定。\n"
-        "输出【是否正常】: True=Qwen正常工作; False=通信异常或服务未启动或检测不通过(含\"pass\": false)。\n"
-        "检测结果自动保存到 /mnt/workspace/pickup/{请求标识}_detection.json。"
+        "与独立 Qwen3.8-27B VLM 服务通信（/dev/shm 文件信号，每1秒轮询）。\n"
+        "启用=False：透传模式，结果文本=原始提问词，是否正常=True，不通信。\n"
+        "启用=True：先探心跳预检；通信失败时按【失败回退原文】返回原文或错误；检测不通过返回检测文本。\n"
+        "是否正常: True=正常/透传; False=通信异常或检测不通过(含\"pass\": false)。"
     )
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "optional": {
-                # ── 开关 ─────────────────────────────────────────────
+                # ── 开关 ──
                 "启用": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "节点总开关。设为 False 时不与 Qwen 通信，直接返回(空文本, False)，且“是否正常”输出固定为 False；设为 True 时则正常处理。用于临时禁用节点。",
+                    "tooltip": "总开关。False=透传模式：结果文本=原始提问词，是否正常=True，不通信、二选一开关不生效。",
                 }),
 
-                # ── 数据输入（三种接入方式可同时使用，内部自动合并） ─────
+                # ── 数据输入（三源可同时使用，自动合并）──
                 "图片数据": ("IMAGE", {
-                    "tooltip": "接收 IMAGE 张量（可多张）。可连接 LoadImage / VAEDecode 等节点输出，如：一采解码后的视频帧、参考图。",
+                    "tooltip": "接收 IMAGE 张量（可多张），可连 LoadImage / VAEDecode 输出。",
                 }),
                 "图片路径": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "图片文件绝对路径，每行一个，支持批量。与图片数据可同时使用，内部自动合并。",
+                    "tooltip": "图片绝对路径，每行一个，支持批量，与图片数据自动合并。",
                 }),
                 "视频路径": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "视频文件绝对路径，每行一个，支持批量。按【每秒抽帧数】自动抽帧后合并。",
+                    "tooltip": "视频绝对路径，每行一个，按【每秒抽帧数】抽帧后合并。",
                 }),
 
-                # ── 附加文件（路径为空或不存在则自动跳过） ──────────────
+                # ── 附加文件 ──
                 "技能文件路径": ("STRING", {
                     "default": "",
-                    "tooltip": "H3 官方 Skills(.md) 文件绝对路径。为空或不存在则不使用。默认/自定义由前台 app 决定。",
+                    "tooltip": "H3 Skills(.md) 绝对路径，为空/不存在则不使用。",
                 }),
                 "剧本文件路径": ("STRING", {
                     "default": "",
-                    "tooltip": "完整剧本文件绝对路径。为空或不存在则不使用。为 Qwen 提供全局意境参照。",
+                    "tooltip": "完整剧本绝对路径，为空/不存在则不使用。",
                 }),
 
-                # ── 提示词三件套 ──────────────────────────────────────
+                # ── 提示词三件套 ──
                 "系统提示词": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "给 Qwen 的系统级指令（角色设定/规则/检测标准）。例：'你是视频质检员，检测布局/站位/运镜/动作…'",
+                    "tooltip": "系统级指令（角色/规则/检测标准）。",
                 }),
                 "提问词": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "提问词主体。可直接连接 #138 提示词节点的输出。",
+                    "tooltip": "提问主体，可连 #138 输出。也是【透传/回退】的原文来源（不含附加指令）。",
                 }),
                 "附加指令": ("STRING", {
                     "multiline": True, "default": "",
-                    "tooltip": "拼接在提问词【后面】（Transformer 尾部注意力更高，约束力强于提问词主体）。用于告诉 Qwen 如何操作提问词。",
+                    "tooltip": "拼接在提问词【后面】（尾部注意力更高），告诉 Qwen 如何操作提问词。",
                 }),
 
-                # ── 推理参数 ──────────────────────────────────────────
+                # ── 推理参数 ──
                 "温度": ("FLOAT", {
                     "default": 0.1, "min": 0.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "采样温度。0.0=严格服从指令；越大 Qwen 自由发挥空间越大。检测任务建议 0.1。",
+                    "tooltip": "采样温度，0=严格服从，越大越自由。",
                 }),
                 "最大输出长度": ("INT", {
                     "default": 2048, "min": 50, "max": 4096, "step": 10,
-                    "tooltip": "Qwen 回复的最大 token 数。完善后的提示词可能几千字，建议 2048~4096。",
+                    "tooltip": "回复最大 token 数，建议 2048~4096。",
                 }),
                 "超时时间": ("INT", {
                     "default": 60, "min": 5, "max": 300, "step": 5,
-                    "tooltip": "等待 Qwen 响应的最大秒数。超时返回异常标志 True，不会让工作流无限卡死。",
+                    "tooltip": "等待推理结果的最大秒数（结果轮询超时）。",
                 }),
 
-                # ── 视频抽帧 & 图片缩放 ───────────────────────────────
+                # ── 服务预检 ──
+                "服务检测超时": ("FLOAT", {
+                    "default": 2.0, "min": 0.5, "max": 30.0, "step": 0.5,
+                    "tooltip": "【开头预检】编码/传输之前探心跳，超时立即返回通信失败，节省时间。",
+                }),
+
+                # ── 文本二选一 ──
+                "失败回退原文": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "仅当 启用=True 且【通信失败】时生效：开→结果文本=原始提问词；关→结果文本=错误信息。检测不通过不受影响。启用=False 时不生效。",
+                }),
+
+                # ── 抽帧 & 缩放 ──
                 "每秒抽帧数": ("FLOAT", {
                     "default": 4.0, "min": 0.5, "max": 24.0, "step": 0.5,
-                    "tooltip": "视频路径的抽帧率（每秒抽几帧）。仅对【视频路径】生效；图片数据/图片路径不受影响。",
+                    "tooltip": "视频抽帧率，仅对【视频路径】生效。",
                 }),
                 "缩放宽度": ("INT", {
                     "default": 640, "min": 128, "max": 1920, "step": 32,
-                    "tooltip": "所有图片统一缩放到的目标宽度。越小传输/推理越快，推荐 640。",
+                    "tooltip": "统一缩放目标宽，推荐 640。",
                 }),
                 "缩放高度": ("INT", {
                     "default": 368, "min": 96, "max": 1080, "step": 16,
-                    "tooltip": "所有图片统一缩放到的目标高度。越小传输/推理越快，推荐 368。",
+                    "tooltip": "统一缩放目标高，推荐 368。",
                 }),
 
-                # ── 标识 ─────────────────────────────────────────────
+                # ── 标识 ──
                 "请求标识": ("STRING", {
                     "default": "",
-                    "tooltip": "取件码（由 app.py 注入）。结果存为 {标识}_detection.json；留空则存为 detection.json。",
+                    "tooltip": "取件码，结果存为 {标识}_detection.json；留空存 detection.json。",
                 }),
             }
         }
 
-    # 输出：结果文本 + 是否正常
-    RETURN_TYPES  = ("STRING", "BOOLEAN")
-    RETURN_NAMES  = ("结果文本", "是否正常")
+    # 输出：结果文本 + 是否正常 + 错误信息
+    RETURN_TYPES  = ("STRING", "BOOLEAN", "STRING")
+    RETURN_NAMES  = ("结果文本", "是否正常", "错误信息")
     FUNCTION      = "communicate"
     CATEGORY      = "H3/Qwen通信"
 
-    # 输出描述（部分前端版本会展示）
     OUTPUT_TOOLTIPS = (
-        "Qwen 的完整回复文本（正常时）或异常信息（异常时）。",
-        "True=Qwen正常工作; False=通信异常/服务未启动/检测不通过。由你决定后续流程。",
+        "启用=False→原始提问词；正常→Qwen回复；通信失败→原文(回退开)或错误(回退关)；检测不通过→检测文本。",
+        "True=正常/透传; False=通信异常或检测不通过。",
+        "仅通信失败/检测不通过时有内容，正常/透传为空。",
     )
 
     # ================================================================
-    #  主函数：收集数据 → 写 shm → 阻塞等待 → 存结果 → 返回
+    #  主函数
     # ================================================================
     def communicate(self, 启用=True, 图片数据=None, 图片路径="", 视频路径="",
                     技能文件路径="", 剧本文件路径="", 系统提示词="", 提问词="",
                     附加指令="", 温度=0.1, 最大输出长度=2048, 超时时间=60,
+                    服务检测超时=2.0, 失败回退原文=False,
                     每秒抽帧数=4.0, 缩放宽度=640, 缩放高度=368, 请求标识="",
                     **kwargs):
 
-        # ── 0. 禁用检查：不通信、不报错、不影响工作流，且“是否正常”固定为 False ──
+        tag = str(请求标识 or "").strip()
+        raw_question = str(提问词 or "").strip()   # 原文（透传/回退用，不含附加指令）
+
+        # ── 0. 透传模式：节点啥都不干，直接返回原始提问词 ──
+        # 是否正常=True 表示"没有问题、放行"；二选一开关在此不生效。
+        # （若你希望透传时 是否正常=False，把下面的 True 改为 False 即可）
         if not 启用:
-            return ("", False)   # 第二个值 False 表示“不正常”（即异常状态）
+            return (raw_question, True, "")
+
+        # ── 1. 服务预检（在编码/传输之前！）──
+        if not self._service_alive(float(服务检测超时)):
+            err = f"{ERR_PREFIX} 未检测到 Qwen 服务（{服务检测超时}s 内无有效心跳），通信失败"
+            return self._comm_fail(err, raw_question, 失败回退原文, tag, save=True)
 
         try:
-            # ── 1. 组装最终提问词（附加指令拼在【后面】，注意力更高）──
-            q = str(提问词 or "").strip()
+            # ── 2. 组装最终提问词（附加指令拼后面）──
+            q = raw_question
             ext = str(附加指令 or "").strip()
             if ext:
                 q = q + "\n" + ext
 
-            # ── 2. 收集所有图片帧（三种来源合并，统一 RGB uint8）──
-            frames = self._collect_frames(
-                图片数据, 图片路径, 视频路径, float(每秒抽帧数))
+            # ── 3. 收集图片帧 ──
+            frames = self._collect_frames(图片数据, 图片路径, 视频路径, float(每秒抽帧数))
 
-            # ── 3. 统一缩放到目标尺寸（减小传输/推理开销）──
+            # ── 4. 缩放 ──
             if frames:
-                frames = self._resize_frames(
-                    frames, int(缩放宽度), int(缩放高度))
+                frames = self._resize_frames(frames, int(缩放宽度), int(缩放高度))
 
-            # ── 4. 读取附加文件（skills / 剧本，路径无效则返回空串）──
+            # ── 5. 读取附加文件 ──
             skills = self._read_file(技能文件路径)
             script = self._read_file(剧本文件路径)
 
-            # ── 5. 清理旧的 shm 文件（防止上一轮残留干扰）──
+            # ── 6. 清理旧 shm ──
             self._cleanup_shm()
 
-            # ── 6. 写入 /dev/shm（帧数据 + 请求参数）──
+            # ── 7. 写 /dev/shm ──
             if frames:
-                arr = np.stack(frames, axis=0)          # [N, H, W, 3] uint8 (RGB)
-                np.save(SHM_FRAMES, arr)
+                np.save(SHM_FRAMES, np.stack(frames, axis=0))
 
             req = {
                 "system_prompt": str(系统提示词 or ""),
@@ -211,56 +228,97 @@ class H3_QwenComm:
                 "temperature":   float(温度),
                 "max_tokens":    int(最大输出长度),
                 "frame_count":   len(frames),
-                "color_order":   "RGB",                 # 告知服务端色彩顺序
+                "color_order":   "RGB",
                 "timestamp":     time.time(),
             }
             with open(SHM_REQUEST, "w", encoding="utf-8") as f:
                 json.dump(req, f, ensure_ascii=False)
 
-            # ── 7. 阻塞等待结果（每 1 秒轮询一次）──
+            # ── 8. 阻塞等待结果 ──
             result_text, result_data = self._wait_result(int(超时时间))
 
-            # ── 8. 保存结果到取件码目录（供脚本/前端抓取）──
-            self._save_result(result_data, str(请求标识 or "").strip())
-
-            # ── 9. 清理 /dev/shm（用完即删，防泄漏）──
+            # ── 9. 存结果 + 清理 ──
+            self._save_result(result_data, tag)
             self._cleanup_shm()
 
-            # ── 10. 判断是否正常 ──
-            # 内部 _check_anomaly 返回 True 表示异常，取反得到“是否正常”
-            is_normal = not self._check_anomaly(result_text)
-
-            return (result_text, is_normal)
+            # ── 10. 分类判断 ──
+            if not self._check_anomaly(result_text):
+                return (result_text, True, "")                      # 正常
+            if self._is_detect_fail(result_text):
+                return (result_text, False, result_text)            # 检测不通过
+            # 通信失败（超时/空结果等）→ 走二选一
+            return self._comm_fail(result_text, raw_question, 失败回退原文, tag, save=False)
 
         except Exception as e:
-            # 节点内部任何未预期异常 → 记录+清理+返回异常（“是否正常”=False）
             err = f"{ERR_PREFIX} 节点内部异常: {e}"
-            self._save_result({"text": err, "error": str(e)},
-                              str(请求标识 or "").strip())
-            self._cleanup_shm()
-            return (err, False)
+            return self._comm_fail(err, raw_question, 失败回退原文, tag, save=True)
 
     # ================================================================
-    #  图片收集：IMAGE张量 / 图片路径 / 视频路径 三源合并
+    #  服务预检（心跳）
+    # ================================================================
+    def _service_alive(self, wait_sec):
+        """在 wait_sec 内等待一个新鲜心跳；有→True，超时→False"""
+        deadline = time.time() + max(0.0, wait_sec)
+        while True:
+            try:
+                age = time.time() - os.path.getmtime(HEARTBEAT)
+                if age <= HEARTBEAT_FRESH:
+                    return True
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    # ================================================================
+    #  通信失败统一返回（含二选一）
+    # ================================================================
+    def _comm_fail(self, err, raw_question, use_fallback, tag, save=True):
+        if save:
+            self._save_result({"text": err, "error": "comm_fail"}, tag)
+        if use_fallback and raw_question:
+            return (raw_question, False, err)   # 回退原文
+        return (err, False, err)                # 返回错误信息
+
+    # ================================================================
+    #  异常分类
+    # ================================================================
+    @staticmethod
+    def _is_detect_fail(text):
+        lo = str(text or "").lower()
+        return ('"pass": false' in lo) or ('"pass":false' in lo)
+
+    @staticmethod
+    def _check_anomaly(text):
+        t = str(text or "").strip()
+        if len(t) < 5:
+            return True
+        lo = t.lower()
+        if '"pass": false' in lo or '"pass":false' in lo:
+            return True
+        if ERR_PREFIX.lower() in lo:
+            return True
+        return False
+
+    # ================================================================
+    #  图片收集 / 抽帧 / 缩放 / 工具
     # ================================================================
     def _collect_frames(self, tensor_in, path_in, video_in, fps):
         frames = []
-
-        # ── 来源1：IMAGE 张量（ComfyUI 为 RGB float32 0~1）──
         if tensor_in is not None:
             try:
-                arr = tensor_in.cpu().numpy()               # [B, H, W, C]
-                if arr.ndim == 3:                           # 单张 [H,W,C] 补维度
+                arr = tensor_in.cpu().numpy()
+                if arr.ndim == 3:
                     arr = arr[None, ...]
-                if arr.shape[-1] == 4:                      # 带 alpha 通道则丢弃
+                if arr.shape[-1] == 4:
                     arr = arr[..., :3]
                 arr = (arr * 255).clip(0, 255).astype(np.uint8)
                 for i in range(arr.shape[0]):
-                    frames.append(arr[i])                   # RGB uint8
+                    frames.append(arr[i])
             except Exception:
                 pass
-
-        # ── 来源2：图片路径（cv2 读取为 BGR，转 RGB 统一）──
         for p in self._lines(path_in):
             if os.path.isfile(p):
                 try:
@@ -270,19 +328,15 @@ class H3_QwenComm:
                         frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 except Exception:
                     pass
-
-        # ── 来源3：视频路径（按帧率抽帧，BGR 转 RGB 统一）──
         for p in self._lines(video_in):
             if os.path.isfile(p):
                 try:
                     frames.extend(self._video_frames(p, fps))
                 except Exception:
                     pass
-
         return frames
 
     def _video_frames(self, path, fps):
-        """从视频按指定帧率均匀抽帧，返回 RGB uint8 列表"""
         import cv2
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
@@ -290,7 +344,6 @@ class H3_QwenComm:
         src_fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
         if src_fps <= 0:
             src_fps = 24.0
-        # 每隔 step 帧取 1 帧
         step = max(1, int(round(src_fps / max(fps, 0.1))))
         out, idx = [], 0
         while True:
@@ -303,9 +356,6 @@ class H3_QwenComm:
         cap.release()
         return out
 
-    # ================================================================
-    #  缩放：统一目标尺寸（INTER_AREA 适合缩小，速度快）
-    # ================================================================
     def _resize_frames(self, frames, tw, th):
         import cv2
         out = []
@@ -316,19 +366,14 @@ class H3_QwenComm:
             out.append(f)
         return out
 
-    # ================================================================
-    #  工具函数
-    # ================================================================
     @staticmethod
     def _lines(text):
-        """多行文本 → 非空行列表（用于路径批量解析）"""
         if not text:
             return []
         return [l.strip() for l in str(text).splitlines() if l.strip()]
 
     @staticmethod
     def _read_file(path):
-        """读取文本文件；路径为空/不存在/读失败 → 返回空串"""
         path = str(path or "").strip()
         if not path or not os.path.isfile(path):
             return ""
@@ -340,7 +385,6 @@ class H3_QwenComm:
 
     @staticmethod
     def _cleanup_shm():
-        """删除 /dev/shm 中三个通信文件（不存在则跳过）"""
         for f in (SHM_FRAMES, SHM_REQUEST, SHM_RESULT):
             try:
                 if os.path.exists(f):
@@ -349,7 +393,6 @@ class H3_QwenComm:
                 pass
 
     def _wait_result(self, timeout_sec):
-        """阻塞轮询结果文件，每 1 秒一次；超时返回异常信息"""
         start = time.time()
         while time.time() - start < timeout_sec:
             if os.path.exists(SHM_RESULT):
@@ -358,15 +401,13 @@ class H3_QwenComm:
                         data = json.load(f)
                     return data.get("text", ""), data
                 except Exception:
-                    pass    # 结果文件可能正在被写入，下一轮再读
+                    pass
             time.sleep(POLL_INTERVAL)
-        # 超时：Qwen 服务未启动或推理过慢
         msg = f"{ERR_PREFIX} 等待超时，Qwen 服务未在 {timeout_sec} 秒内响应"
         return msg, {"text": "", "error": "timeout"}
 
     @staticmethod
     def _save_result(data, tag):
-        """结果持久化到取件码目录；tag 为空存 detection.json"""
         try:
             os.makedirs(PICKUP_DIR, exist_ok=True)
             name = f"{tag}_detection.json" if tag else "detection.json"
@@ -375,26 +416,51 @@ class H3_QwenComm:
         except Exception:
             pass
 
-    @staticmethod
-    def _check_anomaly(text):
-        """
-        异常判断（内部使用）：返回 True 表示异常，False 表示正常。
-        检测条件：
-          1. 文本为空或长度小于5
-          2. 文本包含 '"pass": false'（检测不通过）
-          3. 文本包含错误前缀
-        """
-        t = str(text or "").strip()
-        if len(t) < 5:
-            return True
-        lo = t.lower()
-        if '"pass": false' in lo or '"pass":false' in lo:
-            return True
-        if ERR_PREFIX.lower() in lo:
-            return True
-        return False
+
+# ================================================================
+#  H3_检测门控（配套节点）
+# ================================================================
+class H3_Gate:
+    """
+    H3_检测门控（四态逻辑）：
+      ① 门控启用=False      → 放行（bypass）
+      ② 门控启用+是否正常=True  → 放行
+      ③ 门控启用+是否正常=False → 抛异常终止工作流（跳过二采）
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("LATENT", {"tooltip": "一采 video_latent，原样传给二采链路"}),
+                "是否正常": ("BOOLEAN", {"tooltip": "连接 H3_Qwen通信 的【是否正常】输出"}),
+            },
+            "optional": {
+                "启用": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "与 H3_Qwen通信 的【启用】保持一致。False=bypass 直接放行。",
+                }),
+                "终止信息": ("STRING", {
+                    "multiline": True,
+                    "default": "H3 检测未通过或服务异常，终止本次工作流（跳过二采）。",
+                    "tooltip": "终止时显示的错误信息。",
+                }),
+            }
+        }
+
+    RETURN_TYPES  = ("LATENT",)
+    RETURN_NAMES  = ("latent",)
+    FUNCTION      = "gate"
+    CATEGORY      = "H3/Qwen通信"
+    DESCRIPTION   = "门控：不启用→放行；启用且是否正常=True→放行；启用且是否正常=False→抛异常终止工作流。"
+
+    def gate(self, latent, 是否正常, 启用=True, 终止信息="H3 检测未通过或服务异常，终止本次工作流（跳过二采）。"):
+        if not 启用:
+            return (latent,)
+        if 是否正常:
+            return (latent,)
+        raise RuntimeError(f"[H3_门控] {终止信息}")
 
 
-# ==================== 节点注册 ====================
-NODE_CLASS_MAPPINGS        = {"H3_QwenComm": H3_QwenComm}
-NODE_DISPLAY_NAME_MAPPINGS = {"H3_QwenComm": "H3_Qwen通信"}
+# ==================== 注册 ====================
+NODE_CLASS_MAPPINGS        = {"H3_QwenComm": H3_QwenComm, "H3_Gate": H3_Gate}
+NODE_DISPLAY_NAME_MAPPINGS = {"H3_QwenComm": "H3_Qwen通信", "H3_Gate": "H3_检测门控"}
