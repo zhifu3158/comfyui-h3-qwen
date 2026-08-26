@@ -17,9 +17,9 @@ H3_Qwen通信节点 (comfyui-h3-qwen)
   1. 节点【不判断】是第几次介入（提示词完善 / 画面检测），只负责"传数据+收结果"，
      业务含义由用户通过 系统提示词 / 提问词 / 附加指令 自行指定。
   2. 统一【阻塞式】：写请求后每 1 秒轮询结果，直到超时。
-  3. 【异常标志】是输出（不是输入），由用户自行决定后续工作流走向：
-       False = Qwen 正常工作（完善成功 / 检测通过）
-       True  = 通信异常（未启动/超时/空结果）或 检测不通过（含 "pass": false）
+  3. 【是否正常】是输出（不是输入），由用户自行决定后续工作流走向：
+       True  = Qwen 正常工作（完善成功 / 检测通过）
+       False = 通信异常（未启动/超时/空结果）或 检测不通过（含 "pass": false）
   4. 防泄漏：/dev/shm 固定文件名覆盖写，永远只有 3 个文件，不会累积。
 
 色彩协议（重要）：
@@ -56,14 +56,14 @@ class H3_QwenComm:
     """
     H3_Qwen通信节点：与独立 Qwen3.8 服务通信的"哑管道"。
     输入：图片/视频数据 + 提示词 + 技能/剧本文件路径 + 推理参数
-    输出：结果文本(STRING) + 异常标志(BOOLEAN)
+    输出：结果文本(STRING) + 是否正常(BOOLEAN)
     """
 
     # 节点级描述（显示在 ComfyUI "信息" 面板顶部）
     DESCRIPTION = (
         "与独立运行的 Qwen3.8-27B VLM 服务通信（/dev/shm 文件信号，每1秒轮询）。\n"
         "不判断介入次数：第一次(提示词完善)或第二次(画面检测)由你的系统提示词/提问词决定。\n"
-        "输出【异常标志】: False=Qwen正常; True=通信异常或服务未启动或检测不通过(含\"pass\": false)。\n"
+        "输出【是否正常】: True=Qwen正常工作; False=通信异常或服务未启动或检测不通过(含\"pass\": false)。\n"
         "检测结果自动保存到 /mnt/workspace/pickup/{请求标识}_detection.json。"
     )
 
@@ -74,7 +74,7 @@ class H3_QwenComm:
                 # ── 开关 ─────────────────────────────────────────────
                 "启用": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "节点总开关。设为 False 时不与 Qwen 通信，直接返回(空文本, False)，不影响后续工作流，用于临时禁用。",
+                    "tooltip": "节点总开关。设为 False 时不与 Qwen 通信，直接返回(空文本, False)，且“是否正常”输出固定为 False；设为 True 时则正常处理。用于临时禁用节点。",
                 }),
 
                 # ── 数据输入（三种接入方式可同时使用，内部自动合并） ─────
@@ -150,16 +150,16 @@ class H3_QwenComm:
             }
         }
 
-    # 输出：结果文本 + 异常标志
+    # 输出：结果文本 + 是否正常
     RETURN_TYPES  = ("STRING", "BOOLEAN")
-    RETURN_NAMES  = ("结果文本", "异常标志")
+    RETURN_NAMES  = ("结果文本", "是否正常")
     FUNCTION      = "communicate"
     CATEGORY      = "H3/Qwen通信"
 
     # 输出描述（部分前端版本会展示）
     OUTPUT_TOOLTIPS = (
         "Qwen 的完整回复文本（正常时）或异常信息（异常时）。",
-        "False=Qwen正常工作; True=通信异常/服务未启动/检测不通过。由你决定后续流程。",
+        "True=Qwen正常工作; False=通信异常/服务未启动/检测不通过。由你决定后续流程。",
     )
 
     # ================================================================
@@ -171,9 +171,9 @@ class H3_QwenComm:
                     每秒抽帧数=4.0, 缩放宽度=640, 缩放高度=368, 请求标识="",
                     **kwargs):
 
-        # ── 0. 禁用检查：不通信、不报错、不影响工作流 ──
+        # ── 0. 禁用检查：不通信、不报错、不影响工作流，且“是否正常”固定为 False ──
         if not 启用:
-            return ("", False)
+            return ("", False)   # 第二个值 False 表示“不正常”（即异常状态）
 
         try:
             # ── 1. 组装最终提问词（附加指令拼在【后面】，注意力更高）──
@@ -226,18 +226,19 @@ class H3_QwenComm:
             # ── 9. 清理 /dev/shm（用完即删，防泄漏）──
             self._cleanup_shm()
 
-            # ── 10. 判断异常标志 ──
-            anomaly = self._check_anomaly(result_text)
+            # ── 10. 判断是否正常 ──
+            # 内部 _check_anomaly 返回 True 表示异常，取反得到“是否正常”
+            is_normal = not self._check_anomaly(result_text)
 
-            return (result_text, anomaly)
+            return (result_text, is_normal)
 
         except Exception as e:
-            # 节点内部任何未预期异常 → 记录+清理+返回异常标志 True
+            # 节点内部任何未预期异常 → 记录+清理+返回异常（“是否正常”=False）
             err = f"{ERR_PREFIX} 节点内部异常: {e}"
             self._save_result({"text": err, "error": str(e)},
                               str(请求标识 or "").strip())
             self._cleanup_shm()
-            return (err, True)
+            return (err, False)
 
     # ================================================================
     #  图片收集：IMAGE张量 / 图片路径 / 视频路径 三源合并
@@ -377,20 +378,18 @@ class H3_QwenComm:
     @staticmethod
     def _check_anomaly(text):
         """
-        异常标志判断（核心逻辑）：
-          True  = 通信失败 / 结果为空或过短 / 检测不通过(含 "pass": false)
-          False = 一切正常
-        注意：节点不判断业务含义，只识别 "pass": false 与通信异常。
+        异常判断（内部使用）：返回 True 表示异常，False 表示正常。
+        检测条件：
+          1. 文本为空或长度小于5
+          2. 文本包含 '"pass": false'（检测不通过）
+          3. 文本包含错误前缀
         """
         t = str(text or "").strip()
-        # 空或过短 → 异常
         if len(t) < 5:
             return True
         lo = t.lower()
-        # 检测不通过（第二次介入的 JSON 结果）→ 异常
         if '"pass": false' in lo or '"pass":false' in lo:
             return True
-        # 节点内部异常/超时前缀 → 异常
         if ERR_PREFIX.lower() in lo:
             return True
         return False
